@@ -1,0 +1,12 @@
+# Local MLflow tracking store and artifacts (experiment data, not source).
+mlflow.db
+mlflow.db-journal
+mlartifacts/
+mlruns/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

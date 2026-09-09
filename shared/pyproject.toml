@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlops-shared"
+version = "0.2.0"
+description = "Feature contract and MLflow helpers shared by the training (phase 1) and serving (phase 2) code."
+requires-python = ">=3.10"
+# Deliberately dependency-light: this package is installed into the inference
+# image, so it must not drag training-only libraries (mlflow, scikit-learn) in.
+dependencies = ["pandas>=2.0,<3.0"]
+
+[tool.setuptools]
+packages = ["mlops_shared"]
