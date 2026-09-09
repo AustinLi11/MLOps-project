@@ -1,0 +1,13 @@
+# Development/test dependencies. Deliberately separate from requirements.txt:
+# the Docker image installs only the runtime file, so the test toolchain never
+# ends up in the shipped layers.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+pytest>=8.0,<10.0
+# Starlette's TestClient transport.
+httpx>=0.27,<1.0
+
+# tests/test_api.py trains a throwaway model by importing phase1-mlops/train.py,
+# which needs the training stack. mlflow-skinny (from requirements.txt) already
+# provides the tracking client and model flavors used there.

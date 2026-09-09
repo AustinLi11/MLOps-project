@@ -1,0 +1,32 @@
+# Phase 2: inference service. Everything the container imports is listed here.
+# Install/build from THIS directory so the relative path below resolves:
+#   pip install -r requirements.txt
+
+# Shared feature contract (same code the trainer uses -> no training-serving
+# skew). Non-editable on purpose: the built virtualenv must be self-contained
+# so the Docker builder stage can copy it into the final image.
+../shared
+
+# Web layer
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+
+# Model loading. mlflow-skinny instead of mlflow: it drops pyarrow, matplotlib,
+# flask, gunicorn, docker and the server UI (~230 MB of wheels) that an
+# inference container never uses. See README "镜像体积".
+mlflow-skinny>=3.1,<4.0
+# mlflow>=3 serializes sklearn models with skops, so loading requires it.
+skops>=0.10,<1.0
+# Required to unpickle/deserialize the estimator itself.
+scikit-learn>=1.3,<2.0
+pandas>=2.0,<3.0
+# MLmodel metadata is YAML (used to identify a model loaded from a directory).
+PyYAML>=6.0,<7.0
+# Only used when MODEL_URI is a runs:/ or models:/ reference backed by a
+# SQL tracking store (mlflow-skinny does not pull these in).
+SQLAlchemy>=2.0,<3.0
+alembic>=1.13,<2.0
+
+# Test-only dependencies live in requirements-dev.txt so the image never
+# installs them.

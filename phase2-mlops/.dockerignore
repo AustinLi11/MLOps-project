@@ -1,0 +1,71 @@
+# Build context filter for phase2-mlops/Dockerfile.
+#
+# The build context is the REPOSITORY ROOT (the image needs ../shared), so these
+# patterns are repo-root relative. Docker only reads the ignore file at the
+# context root, so the repository root has a `.dockerignore` symlink pointing
+# here -- one file, one source of truth.
+#
+# Keeping the context small speeds up builds and, more importantly, stops local
+# experiment data and virtualenvs from being shipped into an image.
+
+# --- version control & editor/tooling metadata ---
+.git/
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+.claude/
+**/.gitignore
+**/*.md
+
+# --- virtualenvs (huge, platform-specific, never valid inside the image) ---
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+
+# --- python caches & build leftovers ---
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/build/
+**/dist/
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- phase 1 training code and its local experiment data ---
+# The service receives a model at runtime through MODEL_URI; it must never be
+# baked in at build time.
+phase1-mlops/
+**/mlflow.db
+**/mlflow.db-journal
+**/mlartifacts/
+**/mlruns/
+
+# --- phase 2 files that are not part of the runtime image ---
+phase2-mlops/tests/
+phase2-mlops/requirements-dev.txt
+phase2-mlops/Dockerfile
+phase2-mlops/.dockerignore
+phase2-mlops/export/
+
+# --- 第四阶段：只有 app/ 需要进镜像，监控栈的配置与产物都不需要 ---
+phase4-mlops/monitoring/
+phase4-mlops/grafana/
+phase4-mlops/prometheus/
+phase4-mlops/reports/
+phase4-mlops/docker-compose.yml
+phase4-mlops/Dockerfile
+
+# --- 第五阶段：告警/重训脚本不属于推理镜像 ---
+phase5-mlops/
+
+# --- OS noise ---
+.DS_Store
+**/.DS_Store

@@ -1,0 +1,10 @@
+# Exported model directories (binary artifacts; recreate with
+# `mlflow artifacts download`, see README section 5).
+export/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
