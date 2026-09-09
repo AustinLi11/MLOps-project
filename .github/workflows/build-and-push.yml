@@ -1,0 +1,227 @@
+# ==============================================================================
+# Workflow 2/2 — build-and-push
+#
+# 作用：main 分支上测试全绿后，构建第二阶段的推理镜像并推送到 ghcr.io，
+#       镜像 tag 使用本次 commit 的短哈希。
+#
+# 本阶段边界：**只构建和推送镜像，不做任何自动部署**。部署是人工动作，
+#            操作手册见根目录 README「人工确认部署」。
+#
+# 触发条件：
+#   push (main)        只有 main 分支的提交会进来；其他分支和 PR 都不会触发。
+#   workflow_dispatch  手动补跑（例如 ghcr.io 临时故障后重推同一个 commit）。
+#
+# 依赖关系：job `test` 用 `uses:` 复用 test.yml，job `build-and-push` 用
+#          `needs: test` 硬依赖它。test 失败/取消 -> build-and-push 直接 skip，
+#          不存在 sleep、轮询或「猜测测试已完成」的做法。
+# ==============================================================================
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 顶层只给读代码的权限；需要写 registry 的 job 单独提权（见下方 job 级 permissions）。
+permissions:
+  contents: read
+
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  # 构建产物要完整可追溯，不中途取消已经开始的推送。
+  cancel-in-progress: false
+
+env:
+  # 镜像仓库固定用 GitHub Container Registry，凭据直接用 workflow 自带的
+  # GITHUB_TOKEN，不需要额外账号，也不需要在仓库里存任何自定义密钥。
+  REGISTRY: ghcr.io
+  IMAGE_BASENAME: iris-inference
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # job 1：复用 test.yml 的全部测试 job（phase1 + phase2）。
+  # 这是跨 workflow 依赖的实现方式：reusable workflow 让 test.yml 成为本
+  # workflow 的一个 job，从而可以被 `needs` 引用。
+  # ----------------------------------------------------------------------------
+  test:
+    name: Tests (reusable test.yml)
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read # 被调用 workflow 继承这里声明的权限
+
+  # ----------------------------------------------------------------------------
+  # job 2：构建 -> 本地冒烟测试 -> 推送。
+  # 先 build 到本地做冒烟测试，通过后才 push，避免把起不来的镜像发布出去。
+  # ----------------------------------------------------------------------------
+  build-and-push:
+    name: Build image & push to ghcr.io
+    needs: test # ← 硬依赖：test 不成功则本 job 不执行
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # checkout 代码
+      packages: write # 推送镜像到 ghcr.io（这是本 job 唯一的额外权限）
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      tag: ${{ steps.names.outputs.short_sha }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve image name and commit tag
+        id: names
+        # ghcr.io 的仓库路径必须全小写；${VAR,,} 是 bash 的小写展开。
+        # tag 用 `git rev-parse --short HEAD`，与本地 `git log` 看到的短哈希一致。
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short HEAD)"
+          repo_lower="${GITHUB_REPOSITORY,,}"
+          image="${REGISTRY}/${repo_lower}/${IMAGE_BASENAME}"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          # RFC3339 时间戳，供 OCI created 标签使用
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "Image: ${image}:${short_sha}"
+
+      - name: Set up Docker Buildx
+        # docker 官方 action，提供 buildx 构建器与层缓存能力
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        # docker 官方 action。凭据是 Actions 自动注入的 GITHUB_TOKEN，
+        # 不是仓库里存的自定义 secret，也不会出现在任何文件里。
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (load locally, not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          # 构建上下文是仓库根目录：镜像需要 shared/（训练与服务共用的特征契约）。
+          # .dockerignore 会把上下文裁到只剩 shared/ + phase2-mlops/app + requirements.txt。
+          context: .
+          file: phase2-mlops/Dockerfile
+          load: true # 载入本地 docker，供下一步冒烟测试
+          push: false
+          tags: ${{ steps.names.outputs.image }}:${{ steps.names.outputs.short_sha }}
+          # 跨 run 复用层缓存，改业务代码时不重装依赖
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the built image
+        # 冒烟测试的目标是「镜像本身能起来且配置正确」，不是再跑一遍业务逻辑
+        # （业务逻辑由 test.yml 的 22 个服务测试覆盖）。
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}:${{ steps.names.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::非 root 用户检查"
+          uid_line="$(docker run --rm --entrypoint id "$IMAGE")"
+          echo "$uid_line"
+          echo "$uid_line" | grep -q 'uid=10001(appuser)' \
+            || { echo "::error::镜像不是以非特权用户 appuser 运行"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::启动容器并检查 /health 降级语义"
+          # 不给 MODEL_URI：期望服务照常启动，/health 返回 503 + status=degraded，
+          # 这同时验证了「依赖装全了、app 能 import、uvicorn 能监听」。
+          docker run -d --name smoke -p 8000:8000 "$IMAGE"
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /tmp/health.json -w '%{http_code}' http://localhost:8000/health || true)"
+            [ "$code" = "503" ] && break
+            sleep 2
+          done
+          echo "HTTP $code"
+          cat /tmp/health.json
+          [ "$code" = "503" ] || { echo "::error::未按预期返回 503"; docker logs smoke; exit 1; }
+          grep -q '"status": *"degraded"' /tmp/health.json \
+            || { echo "::error::/health 响应缺少 degraded 状态"; exit 1; }
+          docker rm -f smoke >/dev/null
+          echo "::endgroup::"
+
+      - name: Push image to ghcr.io
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: phase2-mlops/Dockerfile
+          push: true
+          # 两个 tag：commit 短哈希（可追溯，验收要求）+ latest（方便拉取）。
+          tags: |
+            ${{ steps.names.outputs.image }}:${{ steps.names.outputs.short_sha }}
+            ${{ steps.names.outputs.image }}:latest
+          # OCI 标准标签：让 ghcr 上的 package 自动关联到本仓库，并记录来源 commit
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.names.outputs.short_sha }}
+            org.opencontainers.image.created=${{ steps.names.outputs.created }}
+          cache-from: type=gha
+          # provenance 关掉：会额外产生 attestation manifest，让 ghcr 的 tag 列表
+          # 出现 unknown/unknown 条目。需要供应链证明时再打开（并加 id-token: write）。
+          provenance: false
+
+      - name: Write deployment summary
+        # 把镜像坐标和人工部署命令直接写到 run summary，部署的人不用翻文档。
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          TAG: ${{ steps.names.outputs.short_sha }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "## ✅ 镜像已推送到 ghcr.io"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 镜像 | \`${IMAGE}:${TAG}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo ""
+            echo "### 人工确认部署（本阶段不自动部署）"
+            echo '```bash'
+            echo "docker pull ${IMAGE}@${DIGEST}"
+            echo "docker run -d --name iris -p 8000:8000 \\"
+            echo "  -e MODEL_URI=/models/current \\"
+            echo "  -v \"\$PWD/model:/models/current:ro\" \\"
+            echo "  ${IMAGE}@${DIGEST}"
+            echo "curl -fsS http://localhost:8000/health"
+            echo '```'
+            echo ""
+            echo "完整步骤（含校验与回滚）见仓库 README「人工确认部署」章节。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------------
+  # job 3：失败时写明失败在哪一环。GitHub 会同时通过 commit 状态标记、Actions
+  # 页面和邮件/Web 通知告知 actor，这里只是把原因和下一步写清楚。
+  # ----------------------------------------------------------------------------
+  report-failure:
+    name: Report pipeline failure
+    needs: [test, build-and-push]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Write failure summary
+        run: |
+          {
+            echo "## ❌ 流水线失败，未推送镜像"
+            echo ""
+            echo "| job | 结论 |"
+            echo "| --- | --- |"
+            echo "| Tests (reusable test.yml) | \`${{ needs.test.result }}\` |"
+            echo "| Build image & push to ghcr.io | \`${{ needs.build-and-push.result }}\` |"
+            echo ""
+            if [ "${{ needs.test.result }}" != "success" ]; then
+              echo "测试未通过，构建被跳过：ghcr.io 上不会出现本次 commit 的镜像。"
+            else
+              echo "测试通过但构建/推送失败：请检查 Dockerfile、冒烟测试输出，"
+              echo "以及仓库 Settings → Actions → Workflow permissions 是否允许写 packages。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,142 @@
+# ==============================================================================
+# Workflow 1/2 — test
+#
+# 作用：跑第一阶段（训练）和第二阶段（推理服务）的全部单元测试。
+#       任一测试失败 -> 本 workflow 失败 -> 依赖它的 build-and-push 不会执行。
+#
+# 触发条件：
+#   push          任意分支（含 main）。每个提交都有独立的测试结论。
+#   pull_request  任意目标分支。结论直接显示在 PR 的 Checks 区域。
+#   workflow_call 被 build-and-push.yml 复用。跨 workflow 的依赖关系就是靠
+#                 「reusable workflow + needs」实现的，没有 sleep / 轮询 / 定时器。
+# ==============================================================================
+name: test
+
+on:
+  push:
+    branches: ["**"] # 任意分支
+  pull_request:
+    branches: ["**"]
+  workflow_call: # 供 build-and-push.yml 以 job 形式调用
+
+# 权限最小化：测试只需要读取代码，显式声明以覆盖仓库/组织的默认权限
+# （默认可能是 read-write-all，属于过高权限）。
+permissions:
+  contents: read
+
+# 同一分支上有新提交时，取消尚在运行的旧 run，避免浪费 CI 分钟数。
+# 注意：被 workflow_call 调用时会继承调用方的 group，不会互相取消。
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.10" # 项目要求 Python 3.10+
+  MLFLOW_DISABLE_AGENT_HINT: "1" # 关掉 MLflow 的交互式提示，保持日志干净
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # job 1：第一阶段训练测试（18 个用例）
+  # 覆盖：指标区间、相同参数零误差复现、模型可经 run_id 重新加载、
+  #       params/metrics/git_commit tag 落库、非 git 目录优雅降级、
+  #       超参数全部来自 CLI、共享特征契约（列名/列序/dtype）。
+  # ----------------------------------------------------------------------------
+  training-tests:
+    name: Phase 1 · training tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # 兜底：卡死的 job 不会一直占用 runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 测试不需要再访问 git 远端，不把凭据写进 .git/config
+          persist-credentials: false
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: phase1-mlops/requirements.txt
+
+      - name: Install phase 1 dependencies
+        # 必须在 phase1-mlops/ 下执行：requirements.txt 里的 `-e ../shared`
+        # 是相对当前工作目录解析的（shared = 训练与服务共用的特征契约包）。
+        working-directory: phase1-mlops
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run phase 1 tests
+        working-directory: phase1-mlops
+        run: pytest tests/ -q
+
+  # ----------------------------------------------------------------------------
+  # job 2：第二阶段服务测试（22 个用例）
+  # 覆盖：/health、/predict、8 类非法输入返回 422、模型只加载一次、
+  #       HTTP 与离线预测逐位一致、MODEL_URI 换版本、降级返回 503。
+  #
+  # 为什么独立成一个 job 而不是和 job 1 合并：
+  #   phase1 装完整 mlflow，phase2 装 mlflow-skinny，两者提供同一个 `mlflow`
+  #   包，装在同一个环境里会互相覆盖。拆开跑既能隔离依赖，又能并行省时间。
+  # ----------------------------------------------------------------------------
+  serving-tests:
+    name: Phase 2 · serving tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: phase2-mlops/requirements*.txt
+
+      - name: Install phase 2 dependencies (runtime + dev)
+        # 同样必须在 phase2-mlops/ 下执行：requirements.txt 首行是 `../shared`。
+        working-directory: phase2-mlops
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run phase 2 tests
+        working-directory: phase2-mlops
+        run: pytest tests/ -q
+
+  # ----------------------------------------------------------------------------
+  # job 3：失败时把结论写进 run summary（失败通知机制的一部分）。
+  # GitHub 本身已经会在 PR Checks / commit 状态 / Actions 页面标红并给 actor
+  # 发通知邮件；这个 job 额外提供一段「哪一步失败、怎么本地复现」的说明，
+  # 让通知里的链接点进来就能看到可执行的下一步。详见根目录 README「失败通知」。
+  # ----------------------------------------------------------------------------
+  report-failure:
+    name: Report test failure
+    needs: [training-tests, serving-tests]
+    if: failure() # 仅当上面任一 job 失败时运行（cancelled 不触发）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Write failure summary
+        run: |
+          {
+            echo "## ❌ 测试失败，流水线已终止"
+            echo ""
+            echo "| job | 结论 |"
+            echo "| --- | --- |"
+            echo "| Phase 1 · training tests | \`${{ needs.training-tests.result }}\` |"
+            echo "| Phase 2 · serving tests | \`${{ needs.serving-tests.result }}\` |"
+            echo ""
+            echo "**影响**：\`build-and-push\` 不会执行，ghcr.io 上不会出现本次 commit 的镜像。"
+            echo ""
+            echo "**本地复现**："
+            echo '```bash'
+            echo "cd phase1-mlops && pip install -r requirements.txt && pytest tests/ -q"
+            echo "cd phase2-mlops && pip install -r requirements.txt -r requirements-dev.txt && pytest tests/ -q"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
