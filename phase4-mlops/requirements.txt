@@ -1,0 +1,8 @@
+# 第四阶段服务运行时依赖 = 第二阶段的全部依赖 + Prometheus 埋点。
+# 在 phase4-mlops/ 目录下执行 `pip install -r requirements.txt`：
+# 下面的相对路径（以及 phase2 清单里的 `../shared`）都按当前工作目录解析。
+
+-r ../phase2-mlops/requirements.txt
+
+# FastAPI 自动埋点：请求数、延迟直方图、按状态码分类的计数、in-progress
+prometheus-fastapi-instrumentator>=7.0,<9.0

@@ -1,0 +1,47 @@
+# Prometheus 配置：只负责采集「系统指标 + 模型实时指标」。
+# 数据漂移不在这里——那是 monitoring/drift_check.py 的批处理报告。
+
+global:
+  # ── scrape_interval 为什么选 15s ──────────────────────────────────────────
+  # 1) 分辨率：Grafana 面板用 rate(...[1m])，Prometheus 要求窗口内至少有 4 个样本
+  #    才算稳定，15s -> 1 分钟窗口内 4 个点，刚好够用；改成 60s 就只剩 1 个点，
+  #    rate(1m) 直接算不出来，P95 面板也会滞后一分钟以上。
+  # 2) 开销：本服务约 200 条时间序列，15s 间隔 ≈ 1.15M 样本/天 ≈ 每天几 MB，
+  #    单机毫无压力；若降到 5s，样本量和磁盘占用变 3 倍，而这类服务的抖动
+  #    在秒级并没有可解读的信息，属于纯浪费。
+  # 3) 惯例：15s 是 Prometheus 默认值，团队协作时最少解释成本。
+  # 经验法则：scrape_interval ≤ 告警评估窗口 / 4，且 ≥ 目标服务一次抓取的耗时 ×10。
+  scrape_interval: 15s
+
+  # 单次抓取超时。必须小于 scrape_interval，否则抓取会互相叠加。
+  scrape_timeout: 10s
+
+  # 记录规则/告警规则的评估周期，与抓取周期对齐即可。
+  evaluation_interval: 15s
+
+  external_labels:
+    env: local
+    project: mlops-learning
+
+# 本阶段不接 Alertmanager（告警通道在第五阶段）。规则文件留空位：
+# rule_files:
+#   - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # ── 被监控对象：第四阶段的推理服务 ──────────────────────────────────────
+  - job_name: iris-inference
+    metrics_path: /metrics
+    # compose 网络内用服务名解析，端口是容器内端口（不是宿主机映射端口）。
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: iris-inference
+          phase: "4"
+    # 采集失败时目标会在 /targets 页面显示 DOWN，并保留 up=0 时间序列，
+    # 因此「服务挂了」本身也是可查询、可告警的指标：up{job="iris-inference"} == 0
+    honor_labels: false
+
+  # ── Prometheus 自身：用于确认采集链路本身是否健康 ──────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

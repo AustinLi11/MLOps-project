@@ -1,0 +1,20 @@
+# Dashboard 自动加载：把 /var/lib/grafana/dashboards 下的 JSON 全部导入，
+# 不需要在 UI 里手动创建或拖拽面板。
+#
+# 两份 dashboard 刻意分开：
+#   service-overview.json  系统指标（服务健不健康）
+#   model-overview.json    模型指标（预测还可不可信）
+# 两类问题的解读方式不同，不放在同一块面板里（见 README「两类监控」）。
+apiVersion: 1
+
+providers:
+  - name: mlops-dashboards
+    orgId: 1
+    folder: MLOps
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

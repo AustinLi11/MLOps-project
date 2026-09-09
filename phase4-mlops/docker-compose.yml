@@ -1,0 +1,102 @@
+# 第四阶段的本地可观测性栈：推理服务 + Prometheus + Grafana。
+#
+#   cd phase4-mlops
+#   docker compose up -d --build
+#
+#   服务   http://localhost:8000/docs      /metrics 在 http://localhost:8000/metrics
+#   Prom   http://localhost:9090/targets   确认 iris-inference 是 UP
+#   Grafana http://localhost:3000          admin/admin（也开了匿名只读）
+#
+# 注意：这里编排的是「本地学习/演示环境」，不是生产部署。生产上 Prometheus 与
+# Grafana 通常是共享的集群组件，服务只需暴露 /metrics 并被 scrape 到。
+
+name: phase4-mlops
+
+services:
+  # ── 被监控对象：第二阶段的推理服务 + 第四阶段埋点 ────────────────────────
+  api:
+    build:
+      # 构建上下文是仓库根目录：镜像需要 shared/（特征契约）和 phase2-mlops/app（服务本体）
+      context: ..
+      dockerfile: phase4-mlops/Dockerfile
+    image: iris-inference:phase4
+    container_name: phase4-api
+    environment:
+      # 模型在运行时注入，镜像里不含任何模型引用（沿用第二阶段的约定）
+      MODEL_URI: /models/current
+      LOG_LEVEL: INFO
+    volumes:
+      # 第二阶段导出的模型目录，只读挂载。
+      # 没有的话先执行（见 README 步骤 1）：
+      #   MLFLOW_TRACKING_URI="sqlite:///$PWD/phase1-mlops/mlflow.db" \
+      #     mlflow artifacts download --artifact-uri "runs:/<RUN_ID>/model" \
+      #     --dst-path phase2-mlops/export/v1
+      - ../phase2-mlops/export/v1/model:/models/current:ro
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # 与镜像内置 HEALTHCHECK 一致：模型没加载时 /health 返回 503 -> unhealthy
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── 指标采集 ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.6.0
+    container_name: phase4-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 本地演示保留 7 天足够；生产按容量和排障需要调整
+      - --storage.tsdb.retention.time=7d
+      # 允许 `curl -X POST localhost:9090/-/reload` 热加载配置，改 scrape 配置不用重启
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    # 不用 condition: service_healthy —— 服务不健康时也应该继续抓，
+    # 「目标 DOWN」本身就是监控要呈现的信息。
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── 指标可视化 ──────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: phase4-grafana
+    volumes:
+      # 数据源与 dashboard 全部走 provisioning，开箱即用，不需要手动配置
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      # 仅本地演示用的弱口令；任何对外环境都必须改掉（或改用 SSO）
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # 打开匿名只读，方便直接点开链接看板；对外部署时关掉
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # 打开后 Grafana 首页直接是系统指标面板
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/service-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

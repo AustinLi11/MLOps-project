@@ -1,0 +1,12 @@
+# 运行产物：Evidently 报告（单个 HTML 约 4 MB）与漂移 JSON
+reports/
+
+# 模拟流量生成的「当前数据」，可随时用 simulate_traffic.py 重新生成
+monitoring/current_*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

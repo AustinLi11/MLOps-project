@@ -1,0 +1,10 @@
+# 离线/批处理的模型监控依赖。**不装进服务镜像**：Evidently 依赖较重，
+# 而推理路径完全用不到它（漂移分析是批处理，不是实时旁路）。
+#
+#   pip install -r requirements-monitoring.txt
+
+# 复用服务侧依赖：pandas / numpy / scikit-learn / mlflow-skinny（生成参考数据时要打分）
+-r requirements.txt
+
+# 数据与模型漂移报告
+evidently>=0.7,<0.8
