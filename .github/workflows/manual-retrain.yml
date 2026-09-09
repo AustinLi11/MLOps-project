@@ -1,0 +1,246 @@
+# ==============================================================================
+# Workflow 3/3 — manual-retrain（第五阶段：闭环里的**人工确认节点**）
+#
+# 作用：由人确认「这次漂移确实需要重训练」之后，手动执行第一阶段的训练脚本，
+#       并把产出的模型注册到 MLflow Model Registry（**只创建新版本**），
+#       然后生成新旧模型对比报告供人工决策。
+#
+# 安全边界（本阶段的核心）：
+#   ✋ 只有 `workflow_dispatch` 一个触发器 —— 只能由人在 GitHub Actions 页面点击。
+#      这里**故意不声明** workflow_call / repository_dispatch / schedule / push /
+#      workflow_run，因此任何其它 workflow、任何漂移告警都**无法自动触发**它。
+#   ✋ 训练结束后**不设置任何 alias / stage**，不部署、不改线上服务。
+#      「提升为 Production」是另一次人工动作，命令写在 phase5-mlops/README.md。
+#
+# 为什么不自动：线上数据异常（上游埋点故障、采样偏差）同样表现为漂移，
+#              自动重训练很可能用坏数据产出更差的模型并直接上线。
+# ==============================================================================
+name: manual-retrain
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "为什么要重训练？（会写进 MLflow run tag 作为审计记录）"
+        required: true
+        type: string
+      acknowledge:
+        description: "我确认：本流程只产出候选模型，不会自动上线"
+        required: true
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes-I-understand"
+      n_estimators:
+        description: "RandomForest 树的数量"
+        required: false
+        default: "300"
+        type: string
+      max_depth:
+        description: "最大树深（none 表示不限制）"
+        required: false
+        default: "none"
+        type: string
+      random_state:
+        description: "随机种子（决定可复现性与数据切分）"
+        required: false
+        default: "42"
+        type: string
+      registered_model_name:
+        description: "注册到 MLflow Model Registry 的模型名"
+        required: false
+        default: "iris-classifier"
+        type: string
+      baseline:
+        description: "对比基线：run_id 或 models:/<name>@<alias>；留空则自动取上一次 run"
+        required: false
+        default: ""
+        type: string
+
+# 权限最小化：只需要读代码。不需要 packages/contents 写权限——本流程不推镜像、不改仓库。
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-retrain-${{ github.ref }}
+  cancel-in-progress: false # 训练中途被取消会留下半成品 run
+
+env:
+  PYTHON_VERSION: "3.10"
+  MLFLOW_DISABLE_AGENT_HINT: "1"
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # job 1：护栏。确认操作者知道这不是"一键上线"，并把触发信息写进 summary 留痕。
+  # ----------------------------------------------------------------------------
+  guardrail:
+    name: Confirm human intent
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require explicit acknowledgement
+        if: inputs.acknowledge != 'yes-I-understand'
+        run: |
+          {
+            echo "## ❌ 未确认，流程终止"
+            echo ""
+            echo "请把 **acknowledge** 选为 \`yes-I-understand\` 后重新触发。"
+            echo "本流程只训练并注册候选模型，**不会**把任何模型标记为 Production，也不会部署。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::acknowledge 必须选择 yes-I-understand"
+          exit 1
+
+      - name: Record who / why (audit trail)
+        run: |
+          {
+            echo "## 🧑‍⚖️ 人工确认已记录"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 触发人 | @${{ github.actor }} |"
+            echo "| 触发方式 | workflow_dispatch（人工点击） |"
+            echo "| 原因 | ${{ inputs.reason }} |"
+            echo "| 超参数 | n_estimators=${{ inputs.n_estimators }}, max_depth=${{ inputs.max_depth }}, random_state=${{ inputs.random_state }} |"
+            echo "| 注册模型名 | ${{ inputs.registered_model_name }} |"
+            echo "| 对比基线 | ${{ inputs.baseline || '自动取上一次 run' }} |"
+            echo ""
+            echo "> 本流程的边界：训练 → 注册候选版本 → 生成对比报告。**不设置别名/阶段，不部署。**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------------
+  # job 2：重训练 + 注册 + 生成对比报告。
+  # ----------------------------------------------------------------------------
+  retrain:
+    name: Retrain, register candidate, compare
+    needs: guardrail # 护栏不通过就不训练
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            phase1-mlops/requirements.txt
+            phase5-mlops/requirements.txt
+
+      - name: Install phase 1 (training) + phase 5 (reporting) dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # 必须在各自目录下安装：requirements 里的 ../shared 是相对当前目录解析的
+          (cd phase1-mlops && pip install -r requirements.txt)
+          (cd phase5-mlops && pip install -r requirements.txt)
+
+      - name: Resolve MLflow tracking store
+        id: store
+        # 有 MLFLOW_TRACKING_URI secret 就写入长期存储（模型版本才能持久化）；
+        # 没有则退化为 workspace 内的临时 sqlite 存储，并在最后作为 artifact 上传，
+        # 供人下载后合并到本地 store —— 保证本阶段在没有 MLflow 服务器时也能验收。
+        env:
+          TRACKING_URI_SECRET: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TRACKING_URI_SECRET}" ]; then
+            echo "mode=persistent" >> "$GITHUB_OUTPUT"
+            echo "uri=${TRACKING_URI_SECRET}" >> "$GITHUB_OUTPUT"
+            echo "使用仓库 secret 配置的持久化 tracking store"
+          else
+            echo "mode=ephemeral" >> "$GITHUB_OUTPUT"
+            echo "uri=sqlite:///${GITHUB_WORKSPACE}/phase1-mlops/mlflow.db" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 MLFLOW_TRACKING_URI secret，使用临时 store，结果将作为 artifact 上传"
+          fi
+
+      - name: Train and register candidate model (no alias, no stage)
+        id: train
+        env:
+          MLFLOW_TRACKING_URI: ${{ steps.store.outputs.uri }}
+        working-directory: phase1-mlops
+        run: |
+          set -euo pipefail
+          python train.py \
+            --n-estimators "${{ inputs.n_estimators }}" \
+            --max-depth "${{ inputs.max_depth }}" \
+            --random-state "${{ inputs.random_state }}" \
+            --run-name "manual-retrain-${GITHUB_RUN_ID}" \
+            --register-as "${{ inputs.registered_model_name }}" \
+            --tag "trigger=manual_dispatch" \
+            --tag "triggered_by=${{ github.actor }}" \
+            --tag "reason=${{ inputs.reason }}" \
+            --tag "ci_run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --tag "promotion_status=candidate" \
+            | tee train_output.txt
+
+          run_id="$(awk '/run_id/ {print $3; exit}' train_output.txt)"
+          [ -n "$run_id" ] || { echo "::error::未能从训练输出中解析 run_id"; exit 1; }
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate new-vs-old comparison report
+        env:
+          MLFLOW_TRACKING_URI: ${{ steps.store.outputs.uri }}
+        working-directory: phase5-mlops
+        run: |
+          set -euo pipefail
+          baseline_args=()
+          if [ -n "${{ inputs.baseline }}" ]; then
+            baseline_args+=(--baseline "${{ inputs.baseline }}")
+          fi
+          python retrain_report.py \
+            --candidate-run-id "${{ steps.train.outputs.run_id }}" \
+            "${baseline_args[@]}" \
+            --random-state "${{ inputs.random_state }}" \
+            --output reports/retrain_report.md \
+            --json-output reports/retrain_report.json
+
+      - name: Publish report to run summary
+        run: |
+          {
+            echo "## 📊 重训练对比报告（仅供人工决策）"
+            echo ""
+            cat phase5-mlops/reports/retrain_report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison report
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrain-report-${{ steps.train.outputs.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            phase5-mlops/reports/
+            phase1-mlops/train_output.txt
+
+      - name: Upload ephemeral MLflow store (only when no persistent store is configured)
+        # 没有 MLflow 服务器时，把临时 store 打包出来，人可以下载后合并到本地 store，
+        # 这样「新的 MLflow run 确实产生了」是可核验的。
+        if: steps.store.outputs.mode == 'ephemeral'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-store-${{ steps.train.outputs.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            phase1-mlops/mlflow.db
+            phase1-mlops/mlartifacts/
+
+      - name: Restate the manual next step
+        # 这一步只输出文字。整个 workflow 里没有任何设置 alias/stage 或部署的动作。
+        run: |
+          {
+            echo ""
+            echo "### ✋ 下一步需要人工操作（本流程到此结束）"
+            echo ""
+            echo "1. 阅读上面的对比报告与「人工确认清单」；"
+            echo "2. 若决定采用新模型：按 \`phase5-mlops/README.md\` →「人工把候选模型提升为 Production」执行；"
+            echo "3. 再按 \`phase2-mlops/README.md\` →「人工确认部署」重启服务，把 MODEL_URI 指向新模型。"
+            echo ""
+            echo "本次产出的候选模型：\`runs:/${{ steps.train.outputs.run_id }}/model\`"
+            echo "（注册名 \`${{ inputs.registered_model_name }}\`，标签 promotion_status=candidate，"
+            echo "**未设置任何 alias / stage**）"
+          } >> "$GITHUB_STEP_SUMMARY"

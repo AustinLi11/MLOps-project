@@ -1,0 +1,19 @@
+# 第五阶段：漂移告警 + 重训练对比报告。
+# 安装（必须在 phase5-mlops/ 下执行，`../shared` 是相对当前目录解析的）：
+#   pip install -r requirements.txt
+
+# 训练/服务共用的特征契约：报告要用同一份预处理与标签定义
+../shared
+
+# 漂移检测（alert_notifier.py 的 --reference/--current/--demo 路径需要）
+evidently>=0.7,<0.8
+
+# 通知渠道配置解析（Webhook 调用只用标准库 urllib，不额外引入 requests）
+PyYAML>=6.0,<7.0
+
+# retrain_report.py：从 MLflow 读取并加载新旧模型、在同一测试集上评估
+mlflow>=3.1,<4.0
+scikit-learn>=1.3,<2.0
+pandas>=2.0,<3.0
+# mlflow>=3 用 skops 序列化 sklearn 模型，加载时必需
+skops>=0.10,<1.0

@@ -1,0 +1,54 @@
+# ==============================================================================
+# 漂移告警通知配置
+#
+# 切换通知渠道 = 改这个文件，**不需要改任何代码**：
+#   active_channels: [console]        # 本地调试，打印到终端
+#   active_channels: [slack]          # Slack Incoming Webhook
+#   active_channels: [wecom]          # 企业微信群机器人
+#   active_channels: [webhook]        # 任意自建服务（通用 JSON 载荷）
+#   active_channels: [slack, file]    # 同时发 Slack 并落盘留档（可多选）
+#
+# 安全：Webhook URL 一律写成 ${ENV_VAR} 占位符，真实地址放在环境变量或
+#       GitHub Secrets 里，这个文件可以安全地提交进仓库。
+#       占位符对应的环境变量没设置时，程序会明确报错而不是发到错误地址。
+#
+# 新增一个平台：在 alert_notifier.py 里实现 NotificationChannel（一个 send 方法）
+#              并注册进 CHANNELS 字典，然后在这里加一段同名配置即可。
+# ==============================================================================
+
+# 当前生效的渠道（列表，可多选）
+active_channels:
+  - console
+
+# 告警阈值：两个条件同时满足才发通知，避免单个特征的轻微波动造成噪音告警。
+# 注意：这里只决定「是否通知人」，**不会**触发任何自动重训练或自动上线。
+detection:
+  # 至少多少个特征发生漂移
+  min_drifted_features: 1
+  # 漂移特征占全部特征的比例下限（0.25 = 四分之一）
+  drift_share_threshold: 0.25
+
+# 各渠道的参数。只有出现在 active_channels 里的渠道才会被构造。
+channels:
+  # 打印到 stdout，无需任何配置
+  console: {}
+
+  # 追加写入 JSONL，用于审计留痕 / 自动化测试断言
+  file:
+    path: alerts/drift_alerts.jsonl # 相对路径按 phase5-mlops/ 解析
+
+  # 通用 JSON Webhook：POST alert_notifier.DriftAlert.to_payload() 的结构化内容
+  webhook:
+    url: ${DRIFT_WEBHOOK_URL}
+    timeout_seconds: 10
+    headers: {} # 需要鉴权时：{ Authorization: "Bearer ${DRIFT_WEBHOOK_TOKEN}" }
+
+  # Slack Incoming Webhook
+  slack:
+    url: ${SLACK_WEBHOOK_URL}
+    timeout_seconds: 10
+
+  # 企业微信群机器人
+  wecom:
+    url: ${WECOM_WEBHOOK_URL}
+    timeout_seconds: 10
